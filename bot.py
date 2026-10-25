@@ -22,20 +22,30 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("emoji-pack-bot")
 
 
+ENV_PATH = Path(__file__).with_name(".env")
+
+
 def load_dotenv(path: Path) -> None:
-    """Minimal .env loader (KEY=VALUE lines) so there's no extra dependency."""
+    """Minimal .env loader (KEY=VALUE lines). Values in .env override existing env vars."""
     if not path.exists():
         return
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):]
         if line and not line.startswith("#") and "=" in line:
             key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+            value = value.strip().strip('"').strip("'").strip()
+            if value:
+                os.environ[key.strip()] = value
 
 
-load_dotenv(Path(__file__).with_name(".env"))
+load_dotenv(ENV_PATH)
 
-TOKEN = os.getenv("BOT_TOKEN", "")
+TOKEN = re.sub(r"\s+", "", os.getenv("BOT_TOKEN", ""))
+if TOKEN.lower().startswith("bot") and ":" in TOKEN:  # people often paste "bot123:abc"
+    TOKEN = TOKEN[3:]
+TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{30,}$")
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
 MAX_PACKS_PER_MESSAGE = 5
 API = f"https://api.telegram.org/bot{TOKEN}"
@@ -270,9 +280,19 @@ def handle_message(msg: dict) -> None:
 
 
 def main() -> None:
+    source = f"{ENV_PATH}" if ENV_PATH.exists() else "BOT_TOKEN environment variable (no .env file found)"
+    masked = f"{TOKEN[:6]}…{TOKEN[-4:]}" if len(TOKEN) > 12 else repr(TOKEN)
     if not TOKEN:
-        raise SystemExit("Set BOT_TOKEN (env var or .env file). Get one from @BotFather.")
-    me = api("getMe")
+        raise SystemExit(f"No BOT_TOKEN found. Put BOT_TOKEN=<token from @BotFather> in {ENV_PATH}")
+    if "replace-me" in TOKEN or not TOKEN_RE.match(TOKEN):
+        raise SystemExit(f"BOT_TOKEN {masked} (from {source}) doesn't look like a real token.\n"
+                         "It should look like 123456789:AAH... - copy it from @BotFather.")
+    try:
+        me = api("getMe")
+    except TelegramError as exc:
+        raise SystemExit(f"Telegram rejected BOT_TOKEN {masked} (from {source}): {exc}\n"
+                         "The token is wrong or was revoked. In @BotFather: /mybots -> your bot -> "
+                         "API Token, then paste the current token into .env.")
     log.info("running as @%s%s", me["username"],
              f" (allowed users: {sorted(ALLOWED)})" if ALLOWED else " (open to everyone)")
     api("setMyCommands", commands=[{"command": "help", "description": "How to use this bot"}])
