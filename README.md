@@ -34,3 +34,9 @@ Then give the `.md` link to your AI with a prompt like:
 ## Requirements for *using* the emoji in your bots
 
 Since Bot API 9.4, a bot can send custom emoji in private chats, groups and supergroups **if the bot's owner has Telegram Premium**. It can also put them on buttons with `icon_custom_emoji_id`. Exporting a pack with this bot doesn't need Premium.
+
+## The bot's own look
+
+The bot's messages, document captions and buttons use icons from the [TG iOS & macOS Icons](https://t.me/addemoji/tgmacicons) pack, which was exported with this bot. All of those icons are in `icons.py`. To restyle the bot, swap the IDs there for ones from any exported pack. The results message has buttons for the Markdown, JSON, each preview sheet and "Add pack to Telegram".
+
+If Telegram refuses the custom emoji (for example, the owner has no Premium), the bot resends the message with plain emoji and keeps using plain emoji. `USE_CUSTOM_EMOJI=0` turns the custom icons off.

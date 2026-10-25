@@ -5,6 +5,7 @@ Run:  BOT_TOKEN=123:abc python bot.py
 from __future__ import annotations
 
 import html
+import json
 import logging
 import os
 import re
@@ -16,7 +17,9 @@ from pathlib import Path
 import requests
 
 import exporter
+import icons
 import uploader
+from icons import e
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("emoji-pack-bot")
@@ -54,16 +57,26 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{TOKEN}"
 PACK_LINK_RE = re.compile(r"(?:t\.me|telegram\.me)/(?:addemoji|addstickers)/([A-Za-z0-9_]+)")
 
-HELP = (
-    "<b>Emoji Pack Exporter</b>\n\n"
-    "Send me any <b>custom emoji</b> (or several), or a pack link like "
-    "<code>t.me/addemoji/PackName</code>.\n\n"
-    "I'll fetch the <b>whole pack</b> and build:\n"
-    "• numbered preview sheets so an AI can <i>see</i> every emoji\n"
-    "• a Markdown + JSON list of every <code>custom_emoji_id</code> with ready-to-paste snippets\n\n"
-    "Everything is uploaded to catbox.moe, so you can paste the Markdown link into any AI "
-    "and let it pick the best-looking emoji for your bots."
-)
+EXAMPLE_PACK = "https://t.me/addemoji/tgmacicons"
+
+
+def help_text() -> str:
+    return (
+        f"{e('gem')} <b>Emoji Pack Exporter</b>\n\n"
+        "Send me any <b>custom emoji</b> (or several), a custom emoji sticker, or a pack link like "
+        "<code>t.me/addemoji/PackName</code>.\n\n"
+        "I'll fetch the <b>whole pack</b> and build:\n"
+        f"{e('image')} numbered preview sheets, so an AI can <i>see</i> every emoji\n"
+        f"{e('doc')} a Markdown file with every <code>custom_emoji_id</code> and ready-to-paste snippets\n"
+        f"{e('json')} the same data as JSON\n\n"
+        f"{e('upload')} Everything is uploaded to catbox.moe and sent here as files.\n\n"
+        f"{e('bulb')} Give the Markdown link to your AI and ask it to pick the best-looking emoji "
+        "for your bots."
+    )
+
+
+def help_markup() -> dict:
+    return {"inline_keyboard": [[icons.button("Example pack", "link", "primary", url=EXAMPLE_PACK)]]}
 
 
 class TelegramError(Exception):
@@ -96,27 +109,61 @@ def api(method: str, files: dict | None = None, http_timeout: float = 60, max_wa
     raise TelegramError(f"{method}: too many retries")
 
 
+def api_msg(method: str, files: dict | None = None, http_timeout: float = 60, max_wait: float = 60,
+            **params):
+    """api() for messages that may contain custom emoji.
+
+    If Telegram refuses the custom emoji (e.g. the bot owner has no Telegram Premium), the message
+    is resent with plain fallback emoji and custom emoji are switched off for the rest of the run.
+    """
+    def call(p: dict):
+        if files:  # multipart: nested objects must be JSON strings
+            p = {k: json.dumps(v) if isinstance(v, (dict, list)) else v for k, v in p.items()}
+        return api(method, files=files, http_timeout=http_timeout, max_wait=max_wait, **p)
+
+    if not icons.ENABLED:
+        return call(icons.strip(params))
+    try:
+        return call(params)
+    except TelegramError as exc:
+        reason = str(exc)
+        if not icons.has_custom(params) or "not modified" in reason or "flood control" in reason:
+            raise
+        result = call(icons.strip(params))
+        icons.ENABLED = False
+        log.warning("Telegram refused custom emoji (%s); using plain emoji from now on. "
+                    "Custom emoji need a bot owner with Telegram Premium.", reason)
+        return result
+
+
 def send(chat_id: int, text: str, reply_to: int | None = None, **extra) -> dict:
     params = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
               "link_preview_options": {"is_disabled": True}, **extra}
     if reply_to:
         params["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
-    return api("sendMessage", **params)
+    return api_msg("sendMessage", **params)
 
 
-def edit(chat_id: int, message_id: int, text: str) -> None:
-    """Best-effort status update: never blocks long and never raises."""
+def edit(chat_id: int, message_id: int, text: str, reply_markup: dict | None = None,
+         max_wait: float = 5) -> bool:
+    """Best-effort status update: never blocks long and never raises. Returns True on success."""
+    params = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML",
+              "link_preview_options": {"is_disabled": True}}
+    if reply_markup:
+        params["reply_markup"] = reply_markup
     try:
-        api("editMessageText", http_timeout=15, max_wait=5, chat_id=chat_id, message_id=message_id,
-            text=text, parse_mode="HTML", link_preview_options={"is_disabled": True})
+        api_msg("editMessageText", http_timeout=15, max_wait=max_wait, **params)
+        return True
     except (TelegramError, requests.RequestException) as exc:
-        if "not modified" not in str(exc):
-            log.warning("edit failed: %s", exc)
+        if "not modified" in str(exc):
+            return True
+        log.warning("edit failed: %s", exc)
+        return False
 
 
 def send_document(chat_id: int, filename: str, content: bytes, caption: str = "") -> None:
-    api("sendDocument", files={"document": (filename, content)}, http_timeout=120,
-        chat_id=chat_id, caption=caption, parse_mode="HTML")
+    api_msg("sendDocument", files={"document": (filename, content)}, http_timeout=120,
+            chat_id=chat_id, caption=caption, parse_mode="HTML")
 
 
 def download_file(file_id: str, deadline: float | None = None) -> bytes | None:
@@ -215,43 +262,65 @@ def upload_safe(filename: str, content: bytes, mime: str) -> uploader.UploadResu
         return None
 
 
-def link_line(label: str, res: uploader.UploadResult | None) -> str:
+def link_line(icon: str, label: str, res: uploader.UploadResult | None) -> str:
     if not res:
-        return f"• {label}: <i>upload failed, sent as file below</i>"
-    note = f" <i>(litterbox, expires in {res.expires})</i>" if res.host == "litterbox" else ""
-    return f'• {label}: <a href="{res.url}">{html.escape(res.url)}</a>{note}'
+        return f"{e('warning')} {label}: <i>upload failed, sent as a file below</i>"
+    return f'{e(icon)} {label}: <a href="{res.url}">{html.escape(res.url)}</a>'
+
+
+def progress_bar(done: int, total: int, width: int = 10) -> str:
+    filled = round(width * done / total) if total else width
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def result_markup(pack: exporter.EmojiPack, md_res, json_res, pages, preview_results) -> dict:
+    """Inline buttons: open the Markdown (main), JSON, each preview sheet and the pack itself."""
+    rows = []
+    if md_res:
+        rows.append([icons.button("Markdown for your AI", "doc", "primary", url=md_res.url)])
+    if json_res:
+        rows.append([icons.button("JSON", "json", url=json_res.url)])
+    previews = [icons.button(f"#{p.first}–{p.last}", "image", url=r.url)
+                for p, r in zip(pages, preview_results) if r]
+    rows += [previews[i:i + 3] for i in range(0, len(previews), 3)]
+    rows.append([icons.button("Add pack to Telegram", "gem", "success", url=pack.link)])
+    return {"inline_keyboard": rows}
 
 
 def process_pack(chat_id: int, reply_to: int, set_name: str) -> None:
-    status = send(chat_id, f"⏳ Fetching pack <code>{html.escape(set_name)}</code>…", reply_to)["message_id"]
+    name = html.escape(set_name)
+    status = send(chat_id, f"{e('search')} Looking up pack <code>{name}</code>…", reply_to)["message_id"]
 
     try:
         sticker_set = api("getStickerSet", name=set_name)
     except TelegramError as exc:
-        edit(chat_id, status, f"❌ Couldn't load <code>{html.escape(set_name)}</code>: {html.escape(str(exc))}")
+        edit(chat_id, status, f"{e('error')} Couldn't load <code>{name}</code>\n"
+                              f"<blockquote>{html.escape(str(exc))}</blockquote>")
         return
     if sticker_set.get("sticker_type") != "custom_emoji":
-        edit(chat_id, status, f"⚠️ <code>{html.escape(set_name)}</code> is a regular sticker pack, "
+        edit(chat_id, status, f"{e('warning')} <code>{name}</code> is a regular sticker pack, "
                               "not a custom emoji pack.")
         return
 
     pack = exporter.build_pack(sticker_set)
     title = html.escape(pack.title)
-    edit(chat_id, status, f"🖼 <b>{title}</b>: downloading {len(pack.emoji)} previews…")
+    header = f"<b>{title}</b> · {len(pack.emoji)} emoji"
+    edit(chat_id, status, f"{e('download')} {header}\nDownloading previews…")
     started = time.monotonic()
     thumbs = fetch_thumbnails(
         sticker_set,
-        progress=lambda done, total: edit(chat_id, status,
-                                          f"🖼 <b>{title}</b>: downloading previews… {done}/{total}"),
+        progress=lambda done, total: edit(
+            chat_id, status, f"{e('download')} {header}\nDownloading previews…\n"
+                             f"<code>{progress_bar(done, total)}</code> {done}/{total}"),
     )
     missing = sum(1 for e in pack.emoji if not thumbs.get(e["custom_emoji_id"]))
     log.info("%s: %d previews in %.1fs, %d missing", set_name, len(pack.emoji) - missing,
              time.monotonic() - started, missing)
 
-    edit(chat_id, status, f"🎨 <b>{title}</b>: rendering preview sheets…")
+    edit(chat_id, status, f"{e('brush')} {header}\nRendering preview sheets…")
     pages = exporter.render_previews(pack, thumbs)
 
-    edit(chat_id, status, f"☁️ <b>{title}</b>: uploading to catbox.moe…")
+    edit(chat_id, status, f"{e('upload')} {header}\nUploading to catbox.moe…")
     preview_results = []
     for page in pages:
         res = upload_safe(page.filename, page.png, "image/png")
@@ -265,36 +334,38 @@ def process_pack(chat_id: int, reply_to: int, set_name: str) -> None:
     md_bytes = exporter.build_markdown(pack, now, json_res.url if json_res else None).encode()
     md_res = upload_safe(f"{pack.name}.md", md_bytes, "text/markdown")
 
+    uploads = [r for r in (md_res, json_res, *preview_results) if r]
+    expiry = next((r.expires for r in uploads if r.host == "litterbox"), None)
+
     lines = [
-        f"✅ <b>{title}</b> (<a href=\"{pack.link}\">{html.escape(pack.name)}</a>): "
-        f"{len(pack.emoji)} emoji",
+        f"{e('done')} <b>{title}</b> is ready",
+        f"<a href=\"{pack.link}\">{html.escape(pack.name)}</a> · {len(pack.emoji)} emoji · "
+        f"{len(pages)} preview sheet{'s' if len(pages) != 1 else ''}",
         "",
-        "<b>Give this link to your AI:</b>",
-        link_line("Markdown (main)", md_res),
-        link_line("JSON", json_res),
+        f"{e('bulb')} <b>Give the Markdown link to your AI:</b>",
+        link_line("doc", "Markdown", md_res),
+        link_line("json", "JSON", json_res),
     ]
-    for page, res in zip(pages, preview_results):
-        lines.append(link_line(f"Preview #{page.first}-#{page.last}", res))
+    lines += [link_line("image", f"#{p.first}–{p.last}", r) for p, r in zip(pages, preview_results)]
+    if expiry:
+        lines += ["", f"{e('clock')} <i>catbox refused the upload, so these are litterbox links "
+                      f"(expire in {expiry}). The files are also attached below.</i>"]
     if missing:
-        lines += ["", f"⚠️ {missing} emoji had no preview (shown as “no preview”); "
-                      "their IDs are still in the files."]
+        lines += ["", f"{e('warning')} {missing} emoji had no preview; their IDs are still in the files."]
     summary = "\n".join(lines)
 
-    # Show a few emoji from the pack; this only renders if the bot owner has Telegram Premium.
-    demo = "".join(e["html"] for e in pack.emoji[:10])
-    try:
-        edit_ok = api("editMessageText", chat_id=chat_id, message_id=status, parse_mode="HTML",
-                      text=f"{summary}\n\n{demo}", link_preview_options={"is_disabled": True})
-    except (TelegramError, requests.RequestException):
-        edit_ok = None
-    if not edit_ok:
-        edit(chat_id, status, summary)
+    # A taste of the pack itself (renders when custom emoji are available).
+    demo = "".join(item["html"] for item in pack.emoji[:12]) if icons.ENABLED else ""
+    markup = result_markup(pack, md_res, json_res, pages, preview_results)
+    if not (demo and edit(chat_id, status, f"{summary}\n\n{demo}", markup, max_wait=30)):
+        if not edit(chat_id, status, summary, markup, max_wait=30):
+            send(chat_id, summary, reply_to, reply_markup=markup)
 
     # Always attach the files too, so nothing is lost if an upload failed or litterbox expires.
-    send_document(chat_id, f"{pack.name}.md", md_bytes, "📄 Feed this to your AI")
-    send_document(chat_id, f"{pack.name}.json", json_bytes)
+    send_document(chat_id, f"{pack.name}.md", md_bytes, f"{e('doc')} <b>Feed this to your AI</b>")
+    send_document(chat_id, f"{pack.name}.json", json_bytes, f"{e('json')} Same data as JSON")
     for page in pages:
-        send_document(chat_id, page.filename, page.png, f"🖼 #{page.first}-#{page.last}")
+        send_document(chat_id, page.filename, page.png, f"{e('image')} Preview #{page.first}–{page.last}")
 
 
 def handle_message(msg: dict) -> None:
@@ -304,27 +375,28 @@ def handle_message(msg: dict) -> None:
         return
 
     text = (msg.get("text") or "").strip()
-    if text.split("@")[0] in ("/start", "/help"):
-        send(chat_id, HELP)
+    if text.split("@")[0].split(" ")[0] in ("/start", "/help"):
+        send(chat_id, help_text(), reply_markup=help_markup())
         return
 
     names, orphans = find_pack_names(msg)
     if not names:
-        hint = ("Those emoji don't belong to a public pack." if orphans else
-                "Send me a <b>custom emoji</b> or a <code>t.me/addemoji/…</code> link. /help")
+        hint = (f"{e('info')} Those emoji don't belong to a public pack." if orphans else
+                f"{e('info')} Send me a <b>custom emoji</b> or a <code>t.me/addemoji/…</code> link.\n"
+                "Need help? /help")
         send(chat_id, hint, msg["message_id"])
         return
 
     if len(names) > MAX_PACKS_PER_MESSAGE:
-        send(chat_id, f"Found {len(names)} packs; processing the first {MAX_PACKS_PER_MESSAGE}.",
+        send(chat_id, f"{e('warning')} Found {len(names)} packs; exporting the first {MAX_PACKS_PER_MESSAGE}.",
              msg["message_id"])
     for name in names[:MAX_PACKS_PER_MESSAGE]:
         try:
             process_pack(chat_id, msg["message_id"], name)
         except Exception as exc:  # keep the bot alive on unexpected errors
             log.exception("failed to process %s", name)
-            send(chat_id, f"❌ Error while processing <code>{html.escape(name)}</code>: "
-                          f"{html.escape(str(exc))}", msg["message_id"])
+            send(chat_id, f"{e('error')} Something went wrong with <code>{html.escape(name)}</code>\n"
+                          f"<blockquote>{html.escape(str(exc))}</blockquote>", msg["message_id"])
 
 
 def main() -> None:
@@ -341,8 +413,9 @@ def main() -> None:
         raise SystemExit(f"Telegram rejected BOT_TOKEN {masked} (from {source}): {exc}\n"
                          "The token is wrong or was revoked. In @BotFather: /mybots -> your bot -> "
                          "API Token, then paste the current token into .env.")
-    log.info("running as @%s%s", me["username"],
-             f" (allowed users: {sorted(ALLOWED)})" if ALLOWED else " (open to everyone)")
+    log.info("running as @%s%s, custom emoji %s", me["username"],
+             f" (allowed users: {sorted(ALLOWED)})" if ALLOWED else " (open to everyone)",
+             "on" if icons.ENABLED else "off")
     api("setMyCommands", commands=[{"command": "help", "description": "How to use this bot"}])
 
     offset = 0
