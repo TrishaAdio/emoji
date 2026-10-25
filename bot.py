@@ -9,7 +9,7 @@ import logging
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,6 +48,8 @@ if TOKEN.lower().startswith("bot") and ":" in TOKEN:  # people often paste "bot1
 TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{30,}$")
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
 MAX_PACKS_PER_MESSAGE = 5
+DOWNLOAD_WORKERS = 4  # parallel thumbnail downloads (more just triggers Telegram flood control)
+DOWNLOAD_BUDGET = float(os.getenv("DOWNLOAD_BUDGET", "150"))  # max seconds spent on previews per pack
 API = f"https://api.telegram.org/bot{TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{TOKEN}"
 PACK_LINK_RE = re.compile(r"(?:t\.me|telegram\.me)/(?:addemoji|addstickers)/([A-Za-z0-9_]+)")
@@ -70,18 +72,24 @@ class TelegramError(Exception):
 
 # ---------------------------------------------------------------- Telegram API helpers
 
-def api(method: str, files: dict | None = None, http_timeout: int = 60, **params):
-    """Call a Bot API method. Retries on flood control (429)."""
+def api(method: str, files: dict | None = None, http_timeout: float = 60, max_wait: float = 60, **params):
+    """Call a Bot API method. Retries on flood control (429) if the wait is at most `max_wait` seconds."""
     for _ in range(5):
         if files:
             resp = requests.post(f"{API}/{method}", data=params, files=files, timeout=http_timeout)
         else:
             resp = requests.post(f"{API}/{method}", json=params, timeout=http_timeout)
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            raise TelegramError(f"{method}: HTTP {resp.status_code}, non-JSON response") from None
         if data.get("ok"):
             return data["result"]
         retry = data.get("parameters", {}).get("retry_after")
         if data.get("error_code") == 429 and retry:
+            if retry > max_wait:
+                raise TelegramError(f"{method}: flood control, retry after {retry}s (limit {max_wait}s)")
+            log.warning("%s: flood control, waiting %ss", method, retry)
             time.sleep(retry + 1)
             continue
         raise TelegramError(f"{method}: {data.get('description')}")
@@ -97,10 +105,11 @@ def send(chat_id: int, text: str, reply_to: int | None = None, **extra) -> dict:
 
 
 def edit(chat_id: int, message_id: int, text: str) -> None:
+    """Best-effort status update: never blocks long and never raises."""
     try:
-        api("editMessageText", chat_id=chat_id, message_id=message_id, text=text, parse_mode="HTML",
-            link_preview_options={"is_disabled": True})
-    except TelegramError as exc:
+        api("editMessageText", http_timeout=15, max_wait=5, chat_id=chat_id, message_id=message_id,
+            text=text, parse_mode="HTML", link_preview_options={"is_disabled": True})
+    except (TelegramError, requests.RequestException) as exc:
         if "not modified" not in str(exc):
             log.warning("edit failed: %s", exc)
 
@@ -110,13 +119,19 @@ def send_document(chat_id: int, filename: str, content: bytes, caption: str = ""
         chat_id=chat_id, caption=caption, parse_mode="HTML")
 
 
-def download_file(file_id: str) -> bytes | None:
+def download_file(file_id: str, deadline: float | None = None) -> bytes | None:
+    """Download a small file (thumbnail). Never raises; gives up once `deadline` (monotonic) passes."""
     try:
-        info = api("getFile", file_id=file_id)
-        resp = requests.get(f"{FILE_API}/{info['file_path']}", timeout=60)
+        if deadline and time.monotonic() > deadline:
+            return None
+        wait_budget = max(0.0, (deadline - time.monotonic()) if deadline else 30.0)
+        info = api("getFile", file_id=file_id, http_timeout=20, max_wait=min(15.0, wait_budget))
+        if deadline and time.monotonic() > deadline:
+            return None
+        resp = requests.get(f"{FILE_API}/{info['file_path']}", timeout=(10, 20))
         resp.raise_for_status()
         return resp.content
-    except (TelegramError, requests.RequestException) as exc:
+    except Exception as exc:  # thumbnails are optional: never let one break the whole pack
         log.warning("download of %s failed: %s", file_id, exc)
         return None
 
@@ -152,9 +167,13 @@ def find_pack_names(msg: dict) -> tuple[list[str], int]:
     return list(dict.fromkeys(names)), orphans
 
 
-def fetch_thumbnails(sticker_set: dict) -> dict[str, bytes | None]:
-    """Download a still preview for every emoji (thumbnail, or the file itself for static WEBP)."""
-    jobs = {}
+def fetch_thumbnails(sticker_set: dict, progress=None) -> dict[str, bytes | None]:
+    """Download a still preview for every emoji (thumbnail, or the file itself for static WEBP).
+
+    Runs at most DOWNLOAD_BUDGET seconds in total; anything not done by then gets "no preview".
+    `progress(done, total)` is called every few seconds so the user can see it's alive.
+    """
+    jobs: dict[str, str | None] = {}
     for st in sticker_set.get("stickers", []):
         cid = st.get("custom_emoji_id")
         if not cid:
@@ -165,9 +184,27 @@ def fetch_thumbnails(sticker_set: dict) -> dict[str, bytes | None]:
             jobs[cid] = st["file_id"]
         else:
             jobs[cid] = None
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = pool.map(lambda fid: download_file(fid) if fid else None, jobs.values())
-        return dict(zip(jobs.keys(), results))
+
+    results: dict[str, bytes | None] = {cid: None for cid in jobs}
+    todo = {cid: fid for cid, fid in jobs.items() if fid}
+    total, done = len(todo), 0
+    deadline = time.monotonic() + DOWNLOAD_BUDGET
+    last_report = time.monotonic()
+
+    pool = ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS)
+    futures = {pool.submit(download_file, fid, deadline): cid for cid, fid in todo.items()}
+    try:
+        for fut in as_completed(futures, timeout=DOWNLOAD_BUDGET + 10):
+            results[futures[fut]] = fut.result()
+            done += 1
+            if progress and time.monotonic() - last_report >= 3:
+                last_report = time.monotonic()
+                progress(done, total)
+    except FuturesTimeout:
+        log.warning("thumbnail download hit the time budget: %d/%d done", done, total)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return results
 
 
 def upload_safe(filename: str, content: bytes, mime: str) -> uploader.UploadResult | None:
@@ -201,7 +238,15 @@ def process_pack(chat_id: int, reply_to: int, set_name: str) -> None:
     pack = exporter.build_pack(sticker_set)
     title = html.escape(pack.title)
     edit(chat_id, status, f"🖼 <b>{title}</b>: downloading {len(pack.emoji)} previews…")
-    thumbs = fetch_thumbnails(sticker_set)
+    started = time.monotonic()
+    thumbs = fetch_thumbnails(
+        sticker_set,
+        progress=lambda done, total: edit(chat_id, status,
+                                          f"🖼 <b>{title}</b>: downloading previews… {done}/{total}"),
+    )
+    missing = sum(1 for e in pack.emoji if not thumbs.get(e["custom_emoji_id"]))
+    log.info("%s: %d previews in %.1fs, %d missing", set_name, len(pack.emoji) - missing,
+             time.monotonic() - started, missing)
 
     edit(chat_id, status, f"🎨 <b>{title}</b>: rendering preview sheets…")
     pages = exporter.render_previews(pack, thumbs)
@@ -230,6 +275,9 @@ def process_pack(chat_id: int, reply_to: int, set_name: str) -> None:
     ]
     for page, res in zip(pages, preview_results):
         lines.append(link_line(f"Preview #{page.first}-#{page.last}", res))
+    if missing:
+        lines += ["", f"⚠️ {missing} emoji had no preview (shown as “no preview”); "
+                      "their IDs are still in the files."]
     summary = "\n".join(lines)
 
     # Show a few emoji from the pack; this only renders if the bot owner has Telegram Premium.
@@ -237,7 +285,7 @@ def process_pack(chat_id: int, reply_to: int, set_name: str) -> None:
     try:
         edit_ok = api("editMessageText", chat_id=chat_id, message_id=status, parse_mode="HTML",
                       text=f"{summary}\n\n{demo}", link_preview_options={"is_disabled": True})
-    except TelegramError:
+    except (TelegramError, requests.RequestException):
         edit_ok = None
     if not edit_ok:
         edit(chat_id, status, summary)
